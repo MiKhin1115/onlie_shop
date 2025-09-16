@@ -156,15 +156,48 @@ def login_view():
             db.close()
 
 
+def _render_avatar(src: str | None, username: str, size: int = 40):
+    """Show avatar from URL or local path; otherwise use a generated fallback."""
+    if src and isinstance(src, str):
+        if src.startswith("http"):
+            st.image(src, width=size)
+            return
+        if os.path.exists(src):
+            with open(src, "rb") as f:
+                st.image(f.read(), width=size)
+            return
+    # Fallback (auto-generated initials)
+    st.image(
+        f"https://ui-avatars.com/api/?name={username}&size={size*2}&background=random",
+        width=size,
+    )
+
+
 def topbar():
-    user = st.session_state.get("user")
-    cols = st.columns([6, 2, 1])
+    user_state = st.session_state.get("user")
+    cols = st.columns([6, 3, 1])
     with cols[0]:
         st.markdown(f"### 📦 {APP_TITLE}")
+
     with cols[1]:
-        if user:
-            st.caption(
-                f"Signed in as **{user['username']}** {'(admin)' if user['is_admin'] else ''}")
+        if user_state:
+            # Get full user row to read optional avatar_url
+            db = get_db()
+            try:
+                u = db.get(User, user_state["id"])
+                avatar = getattr(u, "avatar_url", None) if u else None
+            finally:
+                db.close()
+
+            a, b = st.columns([1, 4])
+            with a:
+                _render_avatar(avatar, user_state["username"], size=40)
+            with b:
+                st.caption(
+                    f"**{user_state['username']}** "
+                    f"{'(admin)' if user_state['is_admin'] else ''}"
+                )
+
     with cols[2]:
         if st.button("Logout", use_container_width=True):
             st.session_state.user = None
@@ -178,7 +211,7 @@ def sidebar_nav() -> str:
     if user and user.get("is_admin"):
         pages.append("Users")
     pages.append("Settings")
-    return st.sidebar.radio("Go to", pages, index=0)
+    return st.sidebar.radio("", pages, index=0)
 
 
 # -----------------------------
@@ -188,43 +221,83 @@ def sidebar_nav() -> str:
 def page_dashboard():
     db = get_db()
     try:
+        # ---------- KPIs ----------
+        # Avoid None with COALESCE
         prod_count = db.query(func.count(Product.id)).scalar() or 0
         cat_count = db.query(func.count(Category.id)).scalar() or 0
         user_count = db.query(func.count(User.id)).scalar() or 0
-        total_qty = db.query(func.sum(Product.quantity)).scalar() or 0
+        total_qty = db.query(func.coalesce(
+            func.sum(Product.quantity), 0)).scalar()
 
-        # Sales last 30 days
-        since = datetime.utcnow() - relativedelta(days=30)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Products", prod_count)
+        c2.metric("Categories", cat_count)
+        c3.metric("Users", user_count)
+        c4.metric("Total Stock Units", int(total_qty))
+
+        # ---------- Sales (customizable) ----------
+        st.subheader("Sales (choose period)")
+        mode = st.radio(
+            "Range", ["Last N days", "Custom range"], horizontal=True)
+        now = datetime.utcnow()
+
+        if mode == "Last N days":
+            n_days = st.number_input(
+                "Days", min_value=1, max_value=365, value=30, step=1)
+            start_dt = now - relativedelta(days=int(n_days))
+            end_dt = now
+        else:
+            cA, cB = st.columns(2)
+            start_d = cA.date_input(
+                "Start date", value=date.today() - relativedelta(days=30))
+            end_d = cB.date_input("End date",   value=date.today())
+            # Include entire end day by making end exclusive (+1 day)
+            start_dt = datetime.combine(start_d, datetime.min.time())
+            end_dt = datetime.combine(
+                end_d,   datetime.min.time()) + relativedelta(days=1)
+
+        # One query for both modes
         sales_q = (
-            db.query(Sale.sale_date.label("date"),
-                     Sale.quantity, Sale.price_at_sale)
-            .filter(Sale.sale_date >= since)
+            db.query(
+                Sale.sale_date.label("date"),
+                Sale.quantity,
+                Sale.price_at_sale,
+            )
+            .filter(Sale.sale_date >= start_dt, Sale.sale_date < end_dt)
             .all()
         )
+
+        # Build DataFrame
         sales_df = pd.DataFrame(
             [
                 {
                     "date": s.date.date(),
-                    "revenue": s.quantity * s.price_at_sale,
                     "units": s.quantity,
+                    "revenue": s.quantity * s.price_at_sale,
                 }
                 for s in sales_q
             ]
         )
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Products", prod_count)
-        col2.metric("Categories", cat_count)
-        col3.metric("Users", user_count)
-        col4.metric("Total Stock Units", int(total_qty or 0))
 
-        st.subheader("Sales (last 30 days)")
         if not sales_df.empty:
-            daily = sales_df.groupby("date").agg(
-                {"revenue": "sum", "units": "sum"}).reset_index()
-            # st.line_chart(daily.set_index("date")["revenue"], height=220)
+            # Period KPIs
+            k_units = int(sales_df["units"].sum())
+            k_rev = float(sales_df["revenue"].sum())
+            kc1, kc2 = st.columns(2)
+            kc1.metric("Units sold", k_units)
+            kc2.metric("Revenue", f"{k_rev:,.2f}")
+
+            daily = (
+                sales_df.groupby("date", as_index=False)
+                .agg({"units": "sum", "revenue": "sum"})
+                .sort_values("date")
+            )
             st.bar_chart(daily.set_index("date")["units"], height=220)
         else:
-            st.info("No sales recorded in the last 30 days.")
+            # Friendly message with exact dates shown
+            shown_start = start_dt.date().isoformat()
+            shown_end = (end_dt - relativedelta(days=1)).date().isoformat()
+            st.info(f"No sales between {shown_start} and {shown_end}.")
 
         # Low stock
         st.subheader("Low Stock Alerts (≤ 5 units)")

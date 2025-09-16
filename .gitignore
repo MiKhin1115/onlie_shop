@@ -1,4 +1,5 @@
 uploads/
-# .DS_Store
-# __pycache__/
 data/
+inventory.db
+myvenv/
+requirements.txt

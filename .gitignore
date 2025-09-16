@@ -1,1 +1,4 @@
-/uploads
+uploads/
+# .DS_Store
+# __pycache__/
+data/
